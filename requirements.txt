@@ -1,3 +1,5 @@
 tqdm
 fire
 numpy
+openai
+aiohttp
