@@ -6,18 +6,23 @@ tokens/minute.
 
 """
 
-import aiohttp
 import asyncio
 import json
 import os
 import re
-import requests
 import tqdm
 import time
 import openai
 
 from dotenv import load_dotenv
-from prompt_utils import parse_prompt, to_prompt
+from azure import azure_complete
+from prompts import (
+    gpt4_prompt, 
+    gpt_3_5_prompt, 
+    azure_prompt,
+    claude_prompt
+)
+from claude import claude_complete
 
 load_dotenv()
 
@@ -28,6 +33,18 @@ HEADERS = {
 
 HUMAN_EVAL = os.environ['PWD'] + '/data/HumanEval.jsonl'
 OUT_FILE = os.environ['PWD'] + '/results/results-{}-{}.jsonl'
+
+async def retry(sem, fn):
+    for i in range(1, 3):
+        try:
+            async with sem:
+                return await fn()
+        except Exception as e:
+            print(e)
+            print('retrying')
+            time.sleep(0.3*i)
+
+    return await fn()
 
 async def get_completion(sem, prompt, num_tries=1, model='code-davinci-002', num_errors=0):
     #print(num_tries)
@@ -41,17 +58,19 @@ async def get_completion(sem, prompt, num_tries=1, model='code-davinci-002', num
         raise ValueError("num_tries must be 1, 10, or 100")
 
 
-    async with sem:
-        if model in {'gpt-3.5-turbo', 'gpt-4'}:
-            messages = parse_prompt(prompt)
-            completion = await openai.ChatCompletion.acreate(messages=messages, model=model, temperature=temperature, max_tokens=1000, n=num_tries)
-            choices = completion.choices
-            return [choice['message']['content'] for choice in choices]
-
-        else:
-            completion = await openai.Completion.acreate(prompt=prompt, model=model, temperature=temperature, max_tokens=1000, n=num_tries)
-            choices = completion.choices
-            return [choice['text'] for choice in choices]
+    if model in {'gpt-3.5-turbo', 'gpt-4'}:
+        completion = await retry(sem, lambda: openai.ChatCompletion.acreate(messages=prompt, model=model, temperature=temperature, max_tokens=1000, n=num_tries))
+        choices = completion.choices
+        return [choice['message']['content'] for choice in choices]
+    elif model in {'azure-gpt-3.5-turbo'}:
+        completion = await retry(sem, lambda: azure_complete(prompt))
+        return [choice['text'] for choice in completion['choices']]
+    elif 'claude' in model:
+        return await retry(sem, lambda: claude_complete(prompt, model))
+    else:
+        completion = await retry(sem, lambda: openai.Completion.acreate(prompt=prompt, model=model, temperature=temperature, max_tokens=1000, n=num_tries))
+        choices = completion.choices
+        return [choice['text'] for choice in choices]
 
 
 def iter_hval():
@@ -62,7 +81,7 @@ def iter_hval():
 
     return all_lines
 
-async def get_results(num_tries=10, model='code-davinci-002'):
+async def get_results(num_tries=10, model='gpt-4'):
     out_file = OUT_FILE.format(model, num_tries)
 
     with open(out_file, 'w') as f:
@@ -71,37 +90,31 @@ async def get_results(num_tries=10, model='code-davinci-002'):
     sem = asyncio.Semaphore(10)
 
     async def output(prompt, task_id):
-        full_prompt = f'''
-<|im_start|>system<|im_sep|>
-You may only respond with code and comments and the <|start_of_completion|> token.
-<|im_end|>
-<|im_start|>user<|im_sep|>
-You must complete the python function I give you. You will write the completion in the following form:
 
-${{ORIG_FUNCTION}}
-    <|start_of_completion|>
-${{INSERT_COMPLETION}}
-
-ORIG_FUNCTION=
-{prompt}
-
-Please follow the template by repeating the original function, including the <|start_of_completion|> token, then writing the completion.
-<|im_end|>
-'''
+        if model == 'gpt-3.5-turbo':
+            full_prompt = gpt_3_5_prompt(prompt)
+        elif model == 'gpt-4':
+            full_prompt = gpt4_prompt(prompt)
+        elif model == 'azure-gpt-3.5-turbo':
+            full_prompt = azure_prompt(prompt)
+        elif 'claude' in model:
+            full_prompt = claude_prompt(prompt)
 
         async with sem:
             completions = await get_completion(sem, full_prompt, num_tries=num_tries, model=model)
 
         outs = []
+        # print(completions)
         for idx, completion in enumerate(completions):
             if '<|start_of_completion|>' in completion:
                 completion = completion.split('<|start_of_completion|>')[1]
             else:
-                print('no <|start_of_completion|> token')
-                print(completion)
-                print('______')
-                print(prompt)
-                print('')
+                pass
+                # print('no <|start_of_completion|> token')
+                # print(completion)
+                # print('______')
+                # print(prompt)
+                # print('')
             outs.append({'task_id': task_id, 'completion': completion})
 
         return outs
@@ -146,7 +159,11 @@ def remove_bloat(in_jsonl):
 
 if __name__ == '__main__':
     num_tries=1
-    model = 'gpt-4'
+    # model = 'gpt-4'
+    model = 'azure-gpt-3.5-turbo'
+    # model = 'claude-v1.3'
+    # model = 'claude-instant-v1.1'
+    # model = 'gpt-3.5-turbo'
 
     asyncio.run(get_results(num_tries=num_tries, model=model))
 
