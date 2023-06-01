@@ -11,5 +11,5 @@ python run.py
 Then to evaluate the completion results, run
 ```
 pip3 install -e .
-python -m human_eval.evaluate_functional_correctness results/name_of_results_file
+evaluate_functional_correctness results/name_of_results_file
 ```
